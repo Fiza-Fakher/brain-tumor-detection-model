@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from models.cnn.utils import load_model, predict_one
-from opencv import findTumorContour
+from opencv import findTumorContour  # (not used here but kept if you need later)
 
 CASCADE_PATH = os.path.join("models", "haar", "cascade.xml")
 WEIGHTS_PATH = os.path.join("models", "cnn", "base.pt")
@@ -18,6 +18,27 @@ CORS(app)
 model = load_model(WEIGHTS_PATH)
 cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
+
+def is_likely_mri(img_bgr) -> bool:
+    """
+    Heuristic check (FYP-friendly):
+    MRI scans are usually grayscale/low-saturation.
+    Reject highly colorful images (likely not MRI).
+    """
+    if img_bgr is None:
+        return False
+
+    h, w = img_bgr.shape[:2]
+    if h < 64 or w < 64:
+        return False
+
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    sat_mean = float(np.mean(hsv[:, :, 1]))  # saturation channel mean
+
+    # MRI usually very low saturation (0-20). Photos often higher.
+    return sat_mean < 35
+
+
 def conf_to_level(conf01: float) -> str:
     p = float(conf01) * 100.0
     if p < 30:
@@ -28,6 +49,7 @@ def conf_to_level(conf01: float) -> str:
         return "Mid"
     else:
         return "High"
+
 
 def draw_green_yolo_boxes(img_bgr, result, min_conf=0.0, show_level=True):
     out = img_bgr.copy()
@@ -47,14 +69,21 @@ def draw_green_yolo_boxes(img_bgr, result, min_conf=0.0, show_level=True):
         txt = f"{c:.2f} ({c*100:.0f}%) {level}".strip()
 
         cv2.putText(
-            out, txt, (x1, max(0, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+            out,
+            txt,
+            (x1, max(0, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2
         )
     return out
+
 
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
 @app.post("/predict")
 def predict():
@@ -63,6 +92,8 @@ def predict():
       mri: image file (png/jpg/jpeg)
       conf: optional float default 0.25
       returnImage: "true"/"false" (optional)
+
+    If non-MRI image (colorful) -> returns 400 INVALID_MRI
     """
     if "mri" not in request.files:
         return jsonify({"message": "mri file is required"}), 400
@@ -74,6 +105,13 @@ def predict():
     img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return jsonify({"message": "Could not read image"}), 400
+
+    # ✅ MRI validation
+    if not is_likely_mri(img):
+        return jsonify({
+            "message": "Invalid image. Please upload a brain MRI scan.",
+            "code": "INVALID_MRI"
+        }), 400
 
     # YOLO predict
     yolo_result = predict_one(model, img, conf=conf)
@@ -102,6 +140,7 @@ def predict():
             payload["annotatedImageBase64"] = base64.b64encode(buffer.tobytes()).decode("utf-8")
 
     return jsonify(payload), 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
