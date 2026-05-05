@@ -6,7 +6,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from models.cnn.utils import load_model, predict_one
-from opencv import findTumorContour  # (not used here but kept if you need later)
 
 CASCADE_PATH = os.path.join("models", "haar", "cascade.xml")
 WEIGHTS_PATH = os.path.join("models", "cnn", "base.pt")
@@ -33,9 +32,8 @@ def is_likely_mri(img_bgr) -> bool:
         return False
 
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    sat_mean = float(np.mean(hsv[:, :, 1]))  # saturation channel mean
+    sat_mean = float(np.mean(hsv[:, :, 1]))  # saturation mean
 
-    # MRI usually very low saturation (0-20). Photos often higher.
     return sat_mean < 35
 
 
@@ -51,7 +49,11 @@ def conf_to_level(conf01: float) -> str:
         return "High"
 
 
-def draw_green_yolo_boxes(img_bgr, result, min_conf=0.0, show_level=True):
+def draw_red_yolo_boxes(img_bgr, result, min_conf=0.0, show_level=True):
+    """
+    Draw YOLO bounding boxes in RED.
+    If no detections -> returns original image.
+    """
     out = img_bgr.copy()
     if result.boxes is None or len(result.boxes) == 0:
         return out
@@ -64,7 +66,9 @@ def draw_green_yolo_boxes(img_bgr, result, min_conf=0.0, show_level=True):
         if c < float(min_conf):
             continue
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        # RED
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
         level = conf_to_level(c) if show_level else ""
         txt = f"{c:.2f} ({c*100:.0f}%) {level}".strip()
 
@@ -74,7 +78,7 @@ def draw_green_yolo_boxes(img_bgr, result, min_conf=0.0, show_level=True):
             (x1, max(0, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (0, 255, 0),
+            (0, 0, 255),
             2
         )
     return out
@@ -91,22 +95,21 @@ def predict():
     form-data:
       mri: image file (png/jpg/jpeg)
       conf: optional float default 0.25
-      returnImage: "true"/"false" (optional)
 
-    If non-MRI image (colorful) -> returns 400 INVALID_MRI
+    Returns:
+      tumor, prediction, confidence(0..100), severity, annotatedImageBase64
     """
     if "mri" not in request.files:
         return jsonify({"message": "mri file is required"}), 400
 
     conf = float(request.form.get("conf", 0.25))
-    return_image = request.form.get("returnImage", "false").lower() == "true"
 
     f = request.files["mri"]
     img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return jsonify({"message": "Could not read image"}), 400
 
-    # ✅ MRI validation
+    # MRI validation
     if not is_likely_mri(img):
         return jsonify({
             "message": "Invalid image. Please upload a brain MRI scan.",
@@ -125,19 +128,19 @@ def predict():
     confidence_percent = float(top_conf * 100.0)
     severity = conf_to_level(top_conf) if tumor_yes else "N/A"
 
+    # Always return annotated image (red boxes if detections)
+    out = draw_red_yolo_boxes(img, yolo_result, min_conf=conf, show_level=True)
+    ok, buffer = cv2.imencode(".jpg", out)
+    annotated_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8") if ok else ""
+
     payload = {
         "tumor": bool(tumor_yes),
         "prediction": "tumor" if tumor_yes else "no_tumor",
         "confidence": confidence_percent,
         "severity": severity,
         "yoloDetections": int(yolo_count),
+        "annotatedImageBase64": annotated_b64
     }
-
-    if return_image:
-        out = draw_green_yolo_boxes(img, yolo_result, min_conf=conf, show_level=True)
-        ok, buffer = cv2.imencode(".jpg", out)
-        if ok:
-            payload["annotatedImageBase64"] = base64.b64encode(buffer.tobytes()).decode("utf-8")
 
     return jsonify(payload), 200
 
